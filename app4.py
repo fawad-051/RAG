@@ -444,7 +444,7 @@ with col3:
         p = chat_history_path(session_id)
         if os.path.exists(p):
             os.remove(p)
-        st.experimental_rerun()
+        st.rerun()
 
 # -----------------------------
 # Admin & diagnostics
@@ -468,3 +468,4 @@ def cleanup_vectorstore_on_exit():
     debug_log("Exiting app. If you want to cleanup vectorstores, use the sidebar button.")
 
 atexit.register(cleanup_vectorstore_on_exit)
+
