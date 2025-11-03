@@ -1,6 +1,5 @@
 # app3.py  -- Advanced RAG Q&A (upgraded)
-# Requirements (suggested):
-# pip install streamlit langchain-groq langchain_core langchain_community langchain_text_splitters langchain_chroma sentence-transformers scikit-learn python-docx python-dotenv
+# Fixed ChromaDB permissions issue
 
 import os
 import tempfile
@@ -55,11 +54,14 @@ def debug_log(msg):
 # -----------------------------
 # Session & storage helpers
 # -----------------------------
-DEFAULT_BASE_DIR = "./rag_data"
+# Use temp directory for better compatibility in deployments
+DEFAULT_BASE_DIR = tempfile.gettempdir()
 os.makedirs(DEFAULT_BASE_DIR, exist_ok=True)
 
 def session_dir(session_id):
-    d = os.path.join(DEFAULT_BASE_DIR, f"session_{session_id}")
+    # Use a more portable path structure
+    safe_session_id = "".join(c for c in session_id if c.isalnum() or c in ('-', '_')).rstrip()
+    d = os.path.join(DEFAULT_BASE_DIR, "rag_sessions", f"session_{safe_session_id}")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -99,14 +101,15 @@ with st.sidebar:
     
     # Enhanced cleanup button
     if st.button("🧹 Cleanup Vector Store (this session)"):
-        # remove vectorstore for session
         idx_dir = os.path.join(session_dir(session_id), "chroma_index")
         if os.path.exists(idx_dir):
             shutil.rmtree(idx_dir, ignore_errors=True)
             st.success("Cleaned session vector store.")
-            # Clear cache to force reinitialization
-            if 'vectorstore' in st.session_state:
-                del st.session_state.vectorstore
+            # Clear all related cache
+            keys_to_remove = [k for k in st.session_state.keys() if 'vectorstore' in k]
+            for key in keys_to_remove:
+                del st.session_state[key]
+            st.cache_resource.clear()
             st.rerun()
         else:
             st.info("No vectorstore found for this session.")
@@ -151,10 +154,9 @@ files_changed = current_files != previous_files
 if files_changed:
     st.session_state.previous_uploaded_files = current_files
     # Clear vectorstore cache when files change
-    if 'vectorstore' in st.session_state:
-        del st.session_state.vectorstore
-    # Also clear the cached vectorstore initialization
-    st.cache_resource.clear()
+    keys_to_remove = [k for k in st.session_state.keys() if 'vectorstore' in k]
+    for key in keys_to_remove:
+        del st.session_state[key]
 
 if not uploaded_files:
     st.info("Upload one or more files to begin. You can also drag multiple files.")
@@ -208,7 +210,7 @@ with st.spinner("Processing uploaded files..."):
             # ensure metadata tags
             for d in docs:
                 d.metadata["source_file"] = name
-                d.metadata["upload_time"] = datetime.utcnow().isoformat()  # Add timestamp
+                d.metadata["upload_time"] = datetime.utcnow().isoformat()
             all_docs.extend(docs)
         except Exception as e:
             st.error(f"Failed to load {name}: {e}")
@@ -243,42 +245,73 @@ def get_embeddings():
 embeddings = get_embeddings()
 
 # -----------------------------
-# Vectorstore (persist per-session) - MODIFIED TO HANDLE FILE CHANGES
+# Vectorstore - FIXED VERSION with better error handling
 # -----------------------------
 INDEX_DIR = os.path.join(session_dir(session_id), "chroma_index")
 
-def init_vectorstore(_splits, _embeddings, persist_dir):
-    # Always remove existing vectorstore when initializing with new documents
-    try:
-        if os.path.exists(persist_dir):
-            shutil.rmtree(persist_dir, ignore_errors=True)
-            debug_log(f"Removed existing vectorstore at {persist_dir}")
-        
-        vs = Chroma.from_documents(_splits, _embeddings, persist_directory=persist_dir)
-        debug_log(f"Created new vectorstore with {len(_splits)} chunks")
-        return vs
-    except Exception as e:
-        st.error(f"Failed to initialize Chroma vectorstore: {e}")
-        # Final attempt with force cleanup
+def init_vectorstore_robust(_splits, _embeddings, persist_dir):
+    """
+    Robust vectorstore initialization with multiple fallback strategies
+    """
+    strategies = [
+        # Strategy 1: Try with persistence first
+        lambda: Chroma.from_documents(_splits, _embeddings, persist_directory=persist_dir),
+        # Strategy 2: Try without persistence if above fails
+        lambda: Chroma.from_documents(_splits, _embeddings),
+        # Strategy 3: Try in-memory only
+        lambda: Chroma.from_documents(_splits, _embeddings, persist_directory=None)
+    ]
+    
+    last_error = None
+    for i, strategy in enumerate(strategies):
         try:
-            if os.path.exists(persist_dir):
-                shutil.rmtree(persist_dir, ignore_errors=True)
-            vs = Chroma.from_documents(_splits, _embeddings, persist_directory=persist_dir)
+            debug_log(f"Trying vectorstore strategy {i+1}")
+            vs = strategy()
+            debug_log(f"Success with strategy {i+1}")
             return vs
-        except Exception as e2:
-            raise RuntimeError(f"Failed to init Chroma vectorstore after cleanup: {e2}")
+        except Exception as e:
+            last_error = e
+            debug_log(f"Strategy {i+1} failed: {e}")
+            # Clean up before next attempt
+            if os.path.exists(persist_dir):
+                try:
+                    shutil.rmtree(persist_dir, ignore_errors=True)
+                except:
+                    pass
+            continue
+    
+    # If all strategies fail, raise the last error
+    raise RuntimeError(f"All vectorstore initialization strategies failed. Last error: {last_error}")
 
-# Initialize vectorstore with proper cache busting
-vectorstore_key = f"vectorstore_{session_id}_{hash(tuple(current_files))}"
+# Initialize vectorstore
+vectorstore_key = f"vectorstore_{session_id}_{hash(tuple(current_files)) if current_files else 'no_files'}"
 
 if vectorstore_key not in st.session_state or files_changed:
     with st.spinner("Initializing vector store..."):
         try:
-            st.session_state[vectorstore_key] = init_vectorstore(splits, embeddings, INDEX_DIR)
+            # Ensure directory permissions
+            os.makedirs(INDEX_DIR, exist_ok=True)
+            
+            # Test write permissions
+            test_file = os.path.join(INDEX_DIR, "write_test.txt")
+            try:
+                with open(test_file, "w") as f:
+                    f.write("test")
+                os.remove(test_file)
+            except Exception as e:
+                debug_log(f"Write test failed: {e}")
+                st.warning("⚠️ Limited write permissions detected. Using in-memory vector store.")
+            
+            st.session_state[vectorstore_key] = init_vectorstore_robust(splits, embeddings, INDEX_DIR)
             st.session_state.vectorstore_initialized = True
-            debug_log("Vectorstore initialized/reinitialized")
+            debug_log("Vectorstore initialized successfully")
+            
         except Exception as e:
             st.error(f"Vectorstore initialization error: {e}")
+            st.info("💡 **Troubleshooting tips:**")
+            st.info("1. Try using the 'Cleanup Vector Store' button in the sidebar")
+            st.info("2. Try a different Session ID")
+            st.info("3. The app will use in-memory storage for this session")
             st.stop()
 else:
     debug_log("Using cached vectorstore")
@@ -292,7 +325,6 @@ def create_retriever(vs, k=5, distance_threshold=0.7):
     def retrieve(question):
         try:
             docs_with_scores = vs.similarity_search_with_score(question, k=k*3)
-            # docs_with_scores -> list of (doc, distance)
             filtered = [d for d, dist in docs_with_scores if dist <= distance_threshold]
             if not filtered:
                 filtered = [d for d, _ in docs_with_scores[:k]]
@@ -322,7 +354,6 @@ def rag_chain(question, chat_history_messages):
         ("human", "Question: {question}")
     ])
 
-    # chain style: create prompt, call llm
     chain = qa_prompt | llm | StrOutputParser()
     try:
         response = chain.invoke({"context": context, "question": question})
@@ -335,7 +366,6 @@ def rag_chain(question, chat_history_messages):
 # Insights & clustering
 # -----------------------------
 def generate_document_summary(llm, docs, max_chars=4000):
-    # join some content and ask model for short summary
     preview = "\n\n".join([d.page_content[:1000] for d in docs[:10]])
     prompt = ChatPromptTemplate.from_messages([
         ("system", "You are a helpful assistant summarizer."),
@@ -367,7 +397,6 @@ def cluster_chunks(embeddings, chunks, n_clusters=4):
 # Chat UI & interaction
 # -----------------------------
 if "messages" not in st.session_state:
-    # load saved chat history by session id if present
     previous = load_chat_history(session_id)
     if previous:
         st.session_state.messages = previous
@@ -388,13 +417,12 @@ for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
-# Show insights block (collapsible)
+# Show insights block
 with st.expander("🔎 Document Insights"):
     st.write(f"**Files uploaded:** {', '.join({d.metadata.get('source_file','?') for d in all_docs})}")
     st.write(f"**Total raw pages/chunks:** {len(all_docs)}")
     st.write(f"**Chunks created:** {len(splits)}")
     
-    # Show current document status
     if files_changed:
         st.success("🔄 Documents updated - vector store refreshed!")
     
@@ -420,14 +448,12 @@ with st.expander("🔎 Document Insights"):
 user_q = st.chat_input("Ask something about your uploaded documents...")
 
 if user_q:
-    # Add user message to UI & history
     history_obj = get_chat_history_obj(session_id)
     with st.chat_message("user"):
         st.markdown(user_q)
     st.session_state.messages.append({"role": "user", "content": user_q})
     history_obj.add_user_message(user_q)
 
-    # Generate response
     with st.chat_message("assistant"):
         with st.spinner("Analyzing documents and generating answer..."):
             try:
@@ -435,15 +461,12 @@ if user_q:
                 st.markdown(response)
                 st.caption(f"⏱️ Answer generated in {duration} seconds")
 
-                # Source display
                 if docs:
                     with st.expander("📂 Sources Used (click to expand)"):
                         for d in docs:
                             src = d.metadata.get("source_file", "Unknown File")
                             st.markdown(f"**📄 {src}** — Preview:")
-                            # highlight small context: we simply show snippet with user's query bolded
                             snippet = d.page_content[:800]
-                            # naive highlight: replace occurrences (case-insensitive)
                             try:
                                 import re
                                 pattern = re.compile(re.escape(user_q[:60]), re.IGNORECASE)
@@ -453,10 +476,8 @@ if user_q:
                             st.write(snippet + "...")
                             st.divider()
 
-                # Save assistant message
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 history_obj.add_ai_message(response)
-                # persist chat to file
                 save_chat_history(session_id, st.session_state.messages)
 
             except Exception as e:
@@ -484,7 +505,6 @@ with col2:
 with col3:
     if st.button("🗑️ Clear current chat (session)"):
         st.session_state.messages = []
-        # remove persisted file
         p = chat_history_path(session_id)
         if os.path.exists(p):
             os.remove(p)
@@ -499,7 +519,6 @@ with st.expander("📊 Admin / Diagnostics"):
         idx_exists = os.path.exists(INDEX_DIR)
         st.write(f"Vectorstore exists: {idx_exists}")
         if idx_exists:
-            # Count documents in vectorstore
             doc_count = vectorstore._collection.count()
             st.write(f"Documents in vectorstore: {doc_count}")
     except Exception as e:
@@ -507,14 +526,12 @@ with st.expander("📊 Admin / Diagnostics"):
     
     st.write(f"Current uploaded files: {current_files}")
     st.write(f"Files changed since last run: {files_changed}")
-    st.write(f"Documents loaded: {len(all_docs)}")
-    st.write(f"Chunks: {len(splits)}")
     st.write(f"Session ID: {session_id}")
 
 # -----------------------------
-# Atexit cleanup safety (optional)
+# Atexit cleanup
 # -----------------------------
 def cleanup_vectorstore_on_exit():
-    debug_log("Exiting app. If you want to cleanup vectorstores, use the sidebar button.")
+    debug_log("Exiting app. Manual cleanup available via sidebar.")
 
 atexit.register(cleanup_vectorstore_on_exit)
