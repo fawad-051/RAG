@@ -96,12 +96,18 @@ with st.sidebar:
     top_k = st.slider("Top K Chunks", 1, 12, 4)
     similarity_threshold = st.slider("Similarity Threshold (distance)", 0.0, 1.0, 0.7)
     debug_checkbox = st.checkbox("Show more debug info", False)
+    
+    # Enhanced cleanup button
     if st.button("🧹 Cleanup Vector Store (this session)"):
         # remove vectorstore for session
         idx_dir = os.path.join(session_dir(session_id), "chroma_index")
         if os.path.exists(idx_dir):
             shutil.rmtree(idx_dir, ignore_errors=True)
             st.success("Cleaned session vector store.")
+            # Clear cache to force reinitialization
+            if 'vectorstore' in st.session_state:
+                del st.session_state.vectorstore
+            st.rerun()
         else:
             st.info("No vectorstore found for this session.")
 
@@ -131,6 +137,25 @@ except Exception as e:
 # -----------------------------
 st.header("📤 Upload documents (PDF / TXT / DOCX)")
 uploaded_files = st.file_uploader("Upload files", type=["pdf", "txt", "docx"], accept_multiple_files=True)
+
+# Track uploaded files to detect changes
+if 'previous_uploaded_files' not in st.session_state:
+    st.session_state.previous_uploaded_files = []
+
+# Check if files have changed
+current_files = [f.name for f in uploaded_files] if uploaded_files else []
+previous_files = st.session_state.previous_uploaded_files
+
+files_changed = current_files != previous_files
+
+if files_changed:
+    st.session_state.previous_uploaded_files = current_files
+    # Clear vectorstore cache when files change
+    if 'vectorstore' in st.session_state:
+        del st.session_state.vectorstore
+    # Also clear the cached vectorstore initialization
+    st.cache_resource.clear()
+
 if not uploaded_files:
     st.info("Upload one or more files to begin. You can also drag multiple files.")
     # Load previous chat history and show quick actions if available
@@ -151,7 +176,6 @@ except Exception:
     from langchain_community.document_loaders import PyPDFLoader as PDFLoader
 
 from langchain_core.documents import Document
-
 
 all_docs = []
 tmp_paths = []
@@ -184,6 +208,7 @@ with st.spinner("Processing uploaded files..."):
             # ensure metadata tags
             for d in docs:
                 d.metadata["source_file"] = name
+                d.metadata["upload_time"] = datetime.utcnow().isoformat()  # Add timestamp
             all_docs.extend(docs)
         except Exception as e:
             st.error(f"Failed to load {name}: {e}")
@@ -218,33 +243,47 @@ def get_embeddings():
 embeddings = get_embeddings()
 
 # -----------------------------
-# Vectorstore (persist per-session)
+# Vectorstore (persist per-session) - MODIFIED TO HANDLE FILE CHANGES
 # -----------------------------
 INDEX_DIR = os.path.join(session_dir(session_id), "chroma_index")
-@st.cache_resource(show_spinner=False)
+
 def init_vectorstore(_splits, _embeddings, persist_dir):
-    # remove previous chroma in this session to avoid stale corruption
+    # Always remove existing vectorstore when initializing with new documents
     try:
+        if os.path.exists(persist_dir):
+            shutil.rmtree(persist_dir, ignore_errors=True)
+            debug_log(f"Removed existing vectorstore at {persist_dir}")
+        
         vs = Chroma.from_documents(_splits, _embeddings, persist_directory=persist_dir)
+        debug_log(f"Created new vectorstore with {len(_splits)} chunks")
         return vs
     except Exception as e:
-        # attempt to cleanup then recreate
+        st.error(f"Failed to initialize Chroma vectorstore: {e}")
+        # Final attempt with force cleanup
         try:
             if os.path.exists(persist_dir):
                 shutil.rmtree(persist_dir, ignore_errors=True)
             vs = Chroma.from_documents(_splits, _embeddings, persist_directory=persist_dir)
             return vs
         except Exception as e2:
-            raise RuntimeError(f"Failed to init Chroma vectorstore: {e2}")
+            raise RuntimeError(f"Failed to init Chroma vectorstore after cleanup: {e2}")
 
-with st.spinner("Initializing vector store..."):
-    try:
-        vectorstore = init_vectorstore(splits, embeddings, INDEX_DIR)
-    except Exception as e:
-        st.error(f"Vectorstore initialization error: {e}")
-        st.stop()
+# Initialize vectorstore with proper cache busting
+vectorstore_key = f"vectorstore_{session_id}_{hash(tuple(current_files))}"
 
-st.session_state.vectorstore_initialized = True
+if vectorstore_key not in st.session_state or files_changed:
+    with st.spinner("Initializing vector store..."):
+        try:
+            st.session_state[vectorstore_key] = init_vectorstore(splits, embeddings, INDEX_DIR)
+            st.session_state.vectorstore_initialized = True
+            debug_log("Vectorstore initialized/reinitialized")
+        except Exception as e:
+            st.error(f"Vectorstore initialization error: {e}")
+            st.stop()
+else:
+    debug_log("Using cached vectorstore")
+
+vectorstore = st.session_state[vectorstore_key]
 
 # -----------------------------
 # Retriever with threshold filtering
@@ -354,6 +393,11 @@ with st.expander("🔎 Document Insights"):
     st.write(f"**Files uploaded:** {', '.join({d.metadata.get('source_file','?') for d in all_docs})}")
     st.write(f"**Total raw pages/chunks:** {len(all_docs)}")
     st.write(f"**Chunks created:** {len(splits)}")
+    
+    # Show current document status
+    if files_changed:
+        st.success("🔄 Documents updated - vector store refreshed!")
+    
     if st.button("🧾 Generate quick summary (using model)"):
         with st.spinner("Generating summary..."):
             summary = generate_document_summary(llm, all_docs)
@@ -454,8 +498,15 @@ with st.expander("📊 Admin / Diagnostics"):
     try:
         idx_exists = os.path.exists(INDEX_DIR)
         st.write(f"Vectorstore exists: {idx_exists}")
-    except Exception:
-        pass
+        if idx_exists:
+            # Count documents in vectorstore
+            doc_count = vectorstore._collection.count()
+            st.write(f"Documents in vectorstore: {doc_count}")
+    except Exception as e:
+        st.write(f"Error checking vectorstore: {e}")
+    
+    st.write(f"Current uploaded files: {current_files}")
+    st.write(f"Files changed since last run: {files_changed}")
     st.write(f"Documents loaded: {len(all_docs)}")
     st.write(f"Chunks: {len(splits)}")
     st.write(f"Session ID: {session_id}")
@@ -464,8 +515,6 @@ with st.expander("📊 Admin / Diagnostics"):
 # Atexit cleanup safety (optional)
 # -----------------------------
 def cleanup_vectorstore_on_exit():
-    # Do NOT auto-delete — we persist per session. This function kept for manual use.
     debug_log("Exiting app. If you want to cleanup vectorstores, use the sidebar button.")
 
 atexit.register(cleanup_vectorstore_on_exit)
-
